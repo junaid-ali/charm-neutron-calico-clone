@@ -1,18 +1,16 @@
 # Copyright 2014-2015 Canonical Limited.
 #
-# This file is part of charm-helpers.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# charm-helpers is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License version 3 as
-# published by the Free Software Foundation.
+#  http://www.apache.org/licenses/LICENSE-2.0
 #
-# charm-helpers is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with charm-helpers.  If not, see <http://www.gnu.org/licenses/>.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 "Interactions with the Juju environment"
 # Copyright 2013 Canonical Ltd.
@@ -45,6 +43,7 @@ ERROR = "ERROR"
 WARNING = "WARNING"
 INFO = "INFO"
 DEBUG = "DEBUG"
+TRACE = "TRACE"
 MARKER = object()
 
 cache = {}
@@ -204,6 +203,29 @@ def service_name():
     return local_unit().split('/')[0]
 
 
+def principal_unit():
+    """Returns the principal unit of this unit, otherwise None"""
+    # Juju 2.2 and above provides JUJU_PRINCIPAL_UNIT
+    principal_unit = os.environ.get('JUJU_PRINCIPAL_UNIT', None)
+    # If it's empty, then this unit is the principal
+    if principal_unit == '':
+        return os.environ['JUJU_UNIT_NAME']
+    elif principal_unit is not None:
+        return principal_unit
+    # For Juju 2.1 and below, let's try work out the principle unit by
+    # the various charms' metadata.yaml.
+    for reltype in relation_types():
+        for rid in relation_ids(reltype):
+            for unit in related_units(rid):
+                md = _metadata_unit(unit)
+                if not md:
+                    continue
+                subordinate = md.pop('subordinate', None)
+                if not subordinate:
+                    return unit
+    return None
+
+
 @cached
 def remote_service_name(relid=None):
     """The remote service name for a given relation-id (or the current relation)"""
@@ -334,6 +356,8 @@ def config(scope=None):
     config_cmd_line = ['config-get']
     if scope is not None:
         config_cmd_line.append(scope)
+    else:
+        config_cmd_line.append('--all')
     config_cmd_line.append('--format=json')
     try:
         config_data = json.loads(
@@ -478,6 +502,24 @@ def metadata():
         return yaml.safe_load(md)
 
 
+def _metadata_unit(unit):
+    """Given the name of a unit (e.g. apache2/0), get the unit charm's
+    metadata.yaml. Very similar to metadata() but allows us to inspect
+    other units. Unit needs to be co-located, such as a subordinate or
+    principal/primary.
+
+    :returns: metadata.yaml as a python object.
+
+    """
+    basedir = os.sep.join(charm_dir().split(os.sep)[:-2])
+    unitdir = 'unit-{}'.format(unit.replace(os.sep, '-'))
+    joineddir = os.path.join(basedir, unitdir, 'charm', 'metadata.yaml')
+    if not os.path.exists(joineddir):
+        return None
+    with open(joineddir) as md:
+        return yaml.safe_load(md)
+
+
 @cached
 def relation_types():
     """Get a list of relation types supported by this charm"""
@@ -602,18 +644,56 @@ def is_relation_made(relation, keys='private-address'):
     return False
 
 
+def _port_op(op_name, port, protocol="TCP"):
+    """Open or close a service network port"""
+    _args = [op_name]
+    icmp = protocol.upper() == "ICMP"
+    if icmp:
+        _args.append(protocol)
+    else:
+        _args.append('{}/{}'.format(port, protocol))
+    try:
+        subprocess.check_call(_args)
+    except subprocess.CalledProcessError:
+        # Older Juju pre 2.3 doesn't support ICMP
+        # so treat it as a no-op if it fails.
+        if not icmp:
+            raise
+
+
 def open_port(port, protocol="TCP"):
     """Open a service network port"""
-    _args = ['open-port']
-    _args.append('{}/{}'.format(port, protocol))
-    subprocess.check_call(_args)
+    _port_op('open-port', port, protocol)
 
 
 def close_port(port, protocol="TCP"):
     """Close a service network port"""
-    _args = ['close-port']
-    _args.append('{}/{}'.format(port, protocol))
+    _port_op('close-port', port, protocol)
+
+
+def open_ports(start, end, protocol="TCP"):
+    """Opens a range of service network ports"""
+    _args = ['open-port']
+    _args.append('{}-{}/{}'.format(start, end, protocol))
     subprocess.check_call(_args)
+
+
+def close_ports(start, end, protocol="TCP"):
+    """Close a range of service network ports"""
+    _args = ['close-port']
+    _args.append('{}-{}/{}'.format(start, end, protocol))
+    subprocess.check_call(_args)
+
+
+def opened_ports():
+    """Get the opened ports
+
+    *Note that this will only show ports opened in a previous hook*
+
+    :returns: Opened ports as a list of strings: ``['8080/tcp', '8081-8083/tcp']``
+    """
+    _args = ['opened-ports', '--format=json']
+    return json.loads(subprocess.check_output(_args).decode('UTF-8'))
 
 
 @cached
@@ -739,6 +819,9 @@ class Hooks(object):
 
 def charm_dir():
     """Return the root directory of the current charm"""
+    d = os.environ.get('JUJU_CHARM_DIR')
+    if d is not None:
+        return d
     return os.environ.get('CHARM_DIR')
 
 
@@ -845,6 +928,20 @@ def translate_exc(from_exc, to_exc):
     return inner_translate_exc1
 
 
+def application_version_set(version):
+    """Charm authors may trigger this command from any hook to output what
+    version of the application is running. This could be a package version,
+    for instance postgres version 9.5. It could also be a build number or
+    version control revision identifier, for instance git sha 6fb7ba68. """
+
+    cmd = ['application-version-set']
+    cmd.append(version)
+    try:
+        subprocess.check_call(cmd)
+    except OSError:
+        log("Application Version: {}".format(version))
+
+
 @translate_exc(from_exc=OSError, to_exc=NotImplementedError)
 def is_leader():
     """Does the current unit hold the juju leadership
@@ -912,6 +1009,24 @@ def payload_status_set(klass, pid, status):
     subprocess.check_call(cmd)
 
 
+@translate_exc(from_exc=OSError, to_exc=NotImplementedError)
+def resource_get(name):
+    """used to fetch the resource path of the given name.
+
+    <name> must match a name of defined resource in metadata.yaml
+
+    returns either a path or False if resource not available
+    """
+    if not name:
+        return False
+
+    cmd = ['resource-get', name]
+    try:
+        return subprocess.check_output(cmd).decode('UTF-8')
+    except subprocess.CalledProcessError:
+        return False
+
+
 @cached
 def juju_version():
     """Full version string (eg. '1.23.3.1-trusty-amd64')"""
@@ -976,3 +1091,76 @@ def _run_atexit():
     for callback, args, kwargs in reversed(_atexit):
         callback(*args, **kwargs)
     del _atexit[:]
+
+
+@translate_exc(from_exc=OSError, to_exc=NotImplementedError)
+def network_get_primary_address(binding):
+    '''
+    Retrieve the primary network address for a named binding
+
+    :param binding: string. The name of a relation of extra-binding
+    :return: string. The primary IP address for the named binding
+    :raise: NotImplementedError if run on Juju < 2.0
+    '''
+    cmd = ['network-get', '--primary-address', binding]
+    return subprocess.check_output(cmd).decode('UTF-8').strip()
+
+
+@translate_exc(from_exc=OSError, to_exc=NotImplementedError)
+def network_get(endpoint, relation_id=None):
+    """
+    Retrieve the network details for a relation endpoint
+
+    :param endpoint: string. The name of a relation endpoint
+    :param relation_id: int. The ID of the relation for the current context.
+    :return: dict. The loaded YAML output of the network-get query.
+    :raise: NotImplementedError if run on Juju < 2.1
+    """
+    cmd = ['network-get', endpoint, '--format', 'yaml']
+    if relation_id:
+        cmd.append('-r')
+        cmd.append(relation_id)
+    try:
+        response = subprocess.check_output(
+            cmd,
+            stderr=subprocess.STDOUT).decode('UTF-8').strip()
+    except CalledProcessError as e:
+        # Early versions of Juju 2.0.x required the --primary-address argument.
+        # We catch that condition here and raise NotImplementedError since
+        # the requested semantics are not available - the caller can then
+        # use the network_get_primary_address() method instead.
+        if '--primary-address is currently required' in e.output.decode('UTF-8'):
+            raise NotImplementedError
+        raise
+    return yaml.safe_load(response)
+
+
+def add_metric(*args, **kwargs):
+    """Add metric values. Values may be expressed with keyword arguments. For
+    metric names containing dashes, these may be expressed as one or more
+    'key=value' positional arguments. May only be called from the collect-metrics
+    hook."""
+    _args = ['add-metric']
+    _kvpairs = []
+    _kvpairs.extend(args)
+    _kvpairs.extend(['{}={}'.format(k, v) for k, v in kwargs.items()])
+    _args.extend(sorted(_kvpairs))
+    try:
+        subprocess.check_call(_args)
+        return
+    except EnvironmentError as e:
+        if e.errno != errno.ENOENT:
+            raise
+    log_message = 'add-metric failed: {}'.format(' '.join(_kvpairs))
+    log(log_message, level='INFO')
+
+
+def meter_status():
+    """Get the meter status, if running in the meter-status-changed hook."""
+    return os.environ.get('JUJU_METER_STATUS')
+
+
+def meter_info():
+    """Get the meter status information, if running in the meter-status-changed
+    hook."""
+    return os.environ.get('JUJU_METER_INFO')
